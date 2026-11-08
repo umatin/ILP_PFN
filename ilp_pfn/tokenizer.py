@@ -26,8 +26,10 @@ SPECIALS = ["<pad>", "<bos>", "<eos>", "<facts>", "<bk>", "<pos>", "<neg>", "<ru
 class Vocab:
     def __init__(self, n_const: int = 32, n_pred: int = 16, n_var: int = 6):
         self.n_const, self.n_pred, self.n_var = n_const, n_pred, n_var
+        # tokens added later are appended at the end so existing ids stay stable
         self.tokens = (SPECIALS + [f"c{i}" for i in range(n_const)]
-                       + [f"p{i}" for i in range(n_pred)] + [f"V{i}" for i in range(n_var)])
+                       + [f"p{i}" for i in range(n_pred)] + [f"V{i}" for i in range(n_var)]
+                       + ["<query>"])
         self.index = {t: i for i, t in enumerate(self.tokens)}
         self.pad_id, self.eos_id = self.index["<pad>"], self.index["<eos>"]
 
@@ -44,8 +46,8 @@ class Vocab:
 VOCAB = Vocab()
 
 # Section ids (0 = before <facts>); sections always appear in this order in a sequence.
-SECTION_OF = {"<facts>": 1, "<bk>": 2, "<pos>": 3, "<neg>": 4, "<rule>": 5}
-N_SECTIONS = 6
+SECTION_OF = {"<facts>": 1, "<bk>": 2, "<pos>": 3, "<neg>": 4, "<rule>": 5, "<query>": 6}
+N_SECTIONS = 7
 # Atom roles: 0 = structural token, 1 = predicate, 2 = first argument, 3 = second argument,
 # 4 = any further argument (only in malformed generations).
 N_ROLES = 5
@@ -151,6 +153,56 @@ def encode(task: Task, rng: np.random.Generator, vocab: Vocab = VOCAB) -> Encode
     rule_start = len(toks)
     toks += program_tokens(task.target_clauses, pred_tok) + ["<eos>"]
     return Encoded(vocab.ids(toks), rule_start, pred_tok, const_tok)
+
+
+# --------------------------------------------------------------------------- query sequences
+QUERY_KINDS = ("target", "base", "derived")
+QUERY_MIX = (0.5, 0.25, 0.25)  # derived falls back to base when the task has no BK
+
+
+@dataclass
+class QueryEncoded:
+    ids: list[int]
+    positions: list[int]   # index (into ids) of the last token of each query atom
+    labels: list[float]    # 1.0 if the queried atom is true in the task's world
+    kinds: list[str]       # "target" / "base" / "derived"
+
+
+def encode_queries(task: Task, enc: Encoded, rng: np.random.Generator, n_queries: int = 16,
+                   vocab: Vocab = VOCAB) -> QueryEncoded:
+    """Prompt (same as ``enc`` up to <rule>, no rule) followed by unlabelled query atoms.
+
+        ... <neg> T c4 c9 ; ... <query> T c4 c9 ; p7 c3 c11 ; p9 c2 ; ... <eos>
+
+    Answers are never part of the sequence: a separate yes/no head reads the hidden state at
+    the last token of each atom, so no query can see another query's answer or the true rule.
+    Each query is true with probability 1/2 when both labels are possible.
+    """
+    toks = vocab.toks(enc.ids[:enc.rule_start - 1]) + ["<query>"]
+    positions, labels, kinds = [], [], []
+    for i in range(n_queries):
+        kind = QUERY_KINDS[int(rng.choice(3, p=QUERY_MIX))]
+        if kind == "derived" and not task.derived_preds:
+            kind = "base"
+        if kind == "target":
+            pred, ext = task.target, task.target_ext
+        else:
+            pool = task.base_preds if kind == "base" else task.derived_preds
+            pred = pool[int(rng.integers(len(pool)))]
+            ext = task.bk_ext[pred]
+        want = bool(rng.random() < 0.5)
+        cands = np.argwhere(ext == want)
+        if len(cands) == 0:
+            cands = np.argwhere(ext != want)
+        t = tuple(int(a) for a in cands[int(rng.integers(len(cands)))])
+        if i:
+            toks.append(";")
+        toks += [enc.pred_tok[pred]] + [enc.const_tok[a] for a in t]
+        positions.append(len(toks) - 1)
+        labels.append(float(ext[t]))
+        kinds.append(kind)
+    toks.append("<eos>")  # keeps the last query token inside the model input (ids[:-1])
+    return QueryEncoded(vocab.ids(toks), positions, labels, kinds)
 
 
 # --------------------------------------------------------------------------- parsing

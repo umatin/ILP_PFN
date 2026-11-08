@@ -4,9 +4,9 @@ import torch
 import torch.nn.functional as F
 
 from ilp_pfn.data import collate
-from ilp_pfn.model import GPT, ModelConfig, generate
+from ilp_pfn.model import GPT, ModelConfig, generate, load_state_compat
 from ilp_pfn.prior import sample_task
-from ilp_pfn.tokenizer import VOCAB, encode
+from ilp_pfn.tokenizer import VOCAB, encode, encode_queries
 from ilp_pfn.verify import check_rule
 
 
@@ -72,8 +72,8 @@ def test_causality():
 
 def test_mask_selects_exactly_rule_tokens():
     items = _items(8)
-    x, y, mask = collate([(e.ids, e.rule_start) for _, e in items], multiple=64)
-    assert x.shape[1] % 64 == 0
+    x, y, mask, qmask, _ = collate([(e.ids, e.rule_start) for _, e in items], multiple=64)
+    assert x.shape[1] % 64 == 0 and not qmask.any()
     for b, (_, e) in enumerate(items):
         assert y[b][mask[b]].tolist() == e.ids[e.rule_start:]
         assert x[b, :len(e.ids) - 1].tolist() == e.ids[:-1]
@@ -84,7 +84,7 @@ def test_overfits_and_generates_valid_rules():
     items = _items(4, seed=1)
     model = tiny()
     opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    x, y, mask = collate([(e.ids, e.rule_start) for _, e in items])
+    x, y, mask = collate([(e.ids, e.rule_start) for _, e in items])[:3]
     for _ in range(300):
         loss = F.cross_entropy(model.logits(model(x)[mask]), y[mask])
         opt.zero_grad()
@@ -97,3 +97,54 @@ def test_overfits_and_generates_valid_rules():
         assert out[0] == out[1] == enc.ids[enc.rule_start:]
         chk = check_rule(task, enc, VOCAB.toks(out[0]))
         assert chk.valid and chk.exact and chk.semantic
+
+
+# ---------------------------------------------------------------- auxiliary query sequences
+def test_query_encoding():
+    rng = np.random.default_rng(0)
+    kinds = set()
+    for task, enc in _items(30, seed=2):
+        q = encode_queries(task, enc, rng, n_queries=16)
+        toks = VOCAB.toks(q.ids)
+        # same prompt as the rule sequence, then queries instead of the rule
+        assert q.ids[:enc.rule_start - 1] == enc.ids[:enc.rule_start - 1]
+        assert "<rule>" not in toks and toks[enc.rule_start - 1] == "<query>"
+        assert toks[-1] == "<eos>" and max(q.positions) < len(q.ids) - 1
+        inv_c = {t: c for c, t in enc.const_tok.items()}
+        inv_p = {t: p for p, t in enc.pred_tok.items()}
+        for pos, lab, kind in zip(q.positions, q.labels, q.kinds):
+            start = pos - task.arities[inv_p[toks[pos - 1]]] if toks[pos - 1] in inv_p else pos - 2
+            atom = toks[start:pos + 1]
+            pred = inv_p[atom[0]]
+            args = tuple(inv_c[a] for a in atom[1:])
+            ext = task.target_ext if pred == task.target else task.bk_ext[pred]
+            assert len(args) == task.arities[pred] and bool(ext[args]) == bool(lab)
+            assert (kind == "target") == (pred == task.target)
+            assert (kind == "derived") == (pred in task.derived_preds)
+            kinds.add(kind)
+    assert kinds == {"target", "base", "derived"}
+
+
+def test_collate_mixed_batch():
+    rng = np.random.default_rng(1)
+    (t0, e0), (t1, e1) = _items(2, seed=3)
+    q = encode_queries(t1, e1, rng, n_queries=5)
+    x, y, mask, qmask, qlab = collate([(e0.ids, e0.rule_start, [], []),
+                                       (q.ids, len(q.ids), q.positions, q.labels)])
+    assert y[0][mask[0]].tolist() == e0.ids[e0.rule_start:] and not mask[1].any()
+    assert not qmask[0].any() and qmask[1].nonzero().squeeze(1).tolist() == q.positions
+    assert qlab[1][qmask[1]].tolist() == q.labels
+    assert (x[1][qmask[1]] == torch.tensor([q.ids[p] for p in q.positions])).all()
+
+
+def test_loads_older_checkpoints():
+    new = tiny(role_emb=True, query_head=True)
+    old_sd = {k: v.clone() for k, v in new.state_dict().items() if not k.startswith("qhead")}
+    old_sd["emb.weight"] = old_sd["emb.weight"][:-1]      # vocab without <query>
+    old_sd["head.weight"] = old_sd["emb.weight"]
+    old_sd["sec_emb.weight"] = old_sd["sec_emb.weight"][:-1]  # sections without <query>
+    model = tiny(role_emb=True, query_head=True)
+    assert load_state_compat(model, old_sd)
+    assert torch.equal(model.emb.weight[:-1], old_sd["emb.weight"])
+    assert model.head.weight is model.emb.weight
+    assert not load_state_compat(model, new.state_dict())  # same version: nothing adapted
