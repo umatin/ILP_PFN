@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .tokenizer import N_ROLES, N_SECTIONS, VOCAB, token_classes
+
 
 @dataclass
 class ModelConfig:
@@ -18,6 +20,7 @@ class ModelConfig:
     d_ff: int = 1536
     max_len: int = 2048       # RoPE table size (training may use shorter sequences)
     rope_base: float = 10000.0
+    role_emb: bool = False    # add section + atom-role embeddings to the token embeddings
 
 
 class KVCache:
@@ -86,6 +89,14 @@ class GPT(nn.Module):
         freqs = torch.outer(torch.arange(cfg.max_len).float(), inv)
         self.register_buffer("cos", freqs.cos(), persistent=False)
         self.register_buffer("sin", freqs.sin(), persistent=False)
+        if cfg.role_emb:
+            assert cfg.vocab_size == len(VOCAB)
+            self.sec_emb = nn.Embedding(N_SECTIONS, cfg.d_model)
+            self.role_emb = nn.Embedding(N_ROLES, cfg.d_model)
+            is_pred, is_term, section = token_classes(VOCAB)
+            self.register_buffer("tok_is_pred", torch.tensor(is_pred), persistent=False)
+            self.register_buffer("tok_is_term", torch.tensor(is_term), persistent=False)
+            self.register_buffer("tok_section", torch.tensor(section), persistent=False)
         self.apply(self._init)
         for blk in self.blocks:  # scaled init of residual projections
             for w in (blk.attn.proj.weight, blk.mlp[2].weight):
@@ -102,13 +113,39 @@ class GPT(nn.Module):
     def new_caches(self) -> list[KVCache]:
         return [KVCache() for _ in self.blocks]
 
-    def forward(self, idx: torch.Tensor, caches: list[KVCache] | None = None) -> torch.Tensor:
-        """Returns final hidden states (B, T, D); apply ``logits`` to the positions you need."""
+    def roles(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Section id and atom role of every token, from the token ids alone (prefix scans).
+
+        ``idx`` must start at the beginning of the sequence; a token's ids depend only on the
+        tokens before it, so this is compatible with causal decoding.
+        """
+        pos = torch.arange(idx.shape[1], device=idx.device).expand_as(idx)
+        none = torch.full_like(idx, -1)
+        is_pred, is_term = self.tok_is_pred[idx], self.tok_is_term[idx]
+        section = torch.cummax(self.tok_section[idx], dim=1).values
+        last_pred = torch.cummax(torch.where(is_pred, pos, none), dim=1).values
+        last_break = torch.cummax(torch.where(~is_pred & ~is_term, pos, none), dim=1).values
+        in_atom = is_term & (last_pred > last_break)  # a term directly following a predicate
+        arg_role = (1 + pos - last_pred).clamp(max=N_ROLES - 1)
+        role = torch.where(is_pred, torch.ones_like(idx),
+                           torch.where(in_atom, arg_role, torch.zeros_like(idx)))
+        return section, role
+
+    def forward(self, idx: torch.Tensor, caches: list[KVCache] | None = None,
+                roles: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+        """Returns final hidden states (B, T, D); apply ``logits`` to the positions you need.
+
+        ``roles``: (section, role) ids for ``idx``; computed from ``idx`` when omitted, which is
+        only correct if ``idx`` is the whole sequence (training, prefill).
+        """
         T = idx.shape[1]
         off = caches[0].length if caches is not None else 0
         assert off + T <= self.cfg.max_len, "sequence longer than the RoPE table"
         cos, sin = self.cos[off:off + T], self.sin[off:off + T]
         x = self.emb(idx)
+        if self.cfg.role_emb:
+            section, role = roles if roles is not None else self.roles(idx)
+            x = x + self.sec_emb(section) + self.role_emb(role)
         for i, blk in enumerate(self.blocks):
             x = blk(x, cos, sin, caches[i] if caches is not None else None)
         return self.ln_f(x)
@@ -126,11 +163,19 @@ def generate(model: GPT, prompt: list[int], n: int, max_new: int, temperature: f
     Each returned sequence ends with eos unless it was truncated.
     """
     caches = model.new_caches()
-    h = model(torch.tensor([prompt], device=device), caches)
+    prompt_t = torch.tensor([prompt], device=device)
+    h = model(prompt_t, caches)
     for c in caches:
         c.k, c.v = c.k.expand(n, -1, -1, -1), c.v.expand(n, -1, -1, -1)
     logits = model.logits(h[:, -1]).float().expand(n, -1)
     out = torch.zeros(n, 0, dtype=torch.long, device=device)
+
+    def step_roles():  # role ids of the newest token, derived from the full history
+        if not model.cfg.role_emb:
+            return None
+        section, role = model.roles(torch.cat([prompt_t.expand(n, -1), out], 1))
+        return section[:, -1:], role[:, -1:]
+
     done = torch.zeros(n, dtype=torch.bool, device=device)
     for _ in range(min(max_new, model.cfg.max_len - len(prompt))):
         if temperature <= 0:
@@ -142,7 +187,7 @@ def generate(model: GPT, prompt: list[int], n: int, max_new: int, temperature: f
         done |= tok == eos_id
         if bool(done.all()) or caches[0].length + 1 > model.cfg.max_len:
             break
-        logits = model.logits(model(tok[:, None], caches)[:, -1]).float()
+        logits = model.logits(model(tok[:, None], caches, step_roles())[:, -1]).float()
     seqs = []
     for row in out.tolist():
         seqs.append(row[:row.index(eos_id) + 1] if eos_id in row else row)

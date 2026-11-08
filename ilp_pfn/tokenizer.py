@@ -43,6 +43,21 @@ class Vocab:
 
 VOCAB = Vocab()
 
+# Section ids (0 = before <facts>); sections always appear in this order in a sequence.
+SECTION_OF = {"<facts>": 1, "<bk>": 2, "<pos>": 3, "<neg>": 4, "<rule>": 5}
+N_SECTIONS = 6
+# Atom roles: 0 = structural token, 1 = predicate, 2 = first argument, 3 = second argument,
+# 4 = any further argument (only in malformed generations).
+N_ROLES = 5
+
+
+def token_classes(vocab: Vocab = VOCAB) -> tuple[list[bool], list[bool], list[int]]:
+    """Per-token-id tables used to derive section / atom-role ids from a token sequence."""
+    is_pred = [t == "T" or (t[0] == "p" and t[1:].isdigit()) for t in vocab.tokens]
+    is_term = [t[0] in "cV" and t[1:].isdigit() for t in vocab.tokens]
+    section = [SECTION_OF.get(t, 0) for t in vocab.tokens]
+    return is_pred, is_term, section
+
 
 @dataclass
 class Encoded:

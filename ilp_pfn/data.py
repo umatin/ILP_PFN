@@ -10,14 +10,21 @@ from .tokenizer import VOCAB, encode
 
 
 class TaskStream(IterableDataset):
-    def __init__(self, prior: PriorConfig, max_len: int, seed: tuple[int, ...]):
-        self.prior, self.max_len, self.seed = prior, max_len, tuple(seed)
+    """Tasks from one prior, or from a weighted mixture of priors (curriculum replay)."""
+
+    def __init__(self, priors: PriorConfig | list[PriorConfig], max_len: int,
+                 seed: tuple[int, ...], weights: list[float] | None = None):
+        self.priors = [priors] if isinstance(priors, PriorConfig) else list(priors)
+        w = np.asarray(weights if weights is not None else [1.0] * len(self.priors), float)
+        self.weights = w / w.sum()
+        self.max_len, self.seed = max_len, tuple(seed)
 
     def __iter__(self):
         info = get_worker_info()
         rng = np.random.default_rng([*self.seed, info.id if info else 0])
         while True:
-            task = sample_task(rng, self.prior)
+            k = int(rng.choice(len(self.priors), p=self.weights)) if len(self.priors) > 1 else 0
+            task = sample_task(rng, self.priors[k])
             enc = encode(task, rng)
             if len(enc.ids) <= self.max_len:
                 yield enc.ids, enc.rule_start

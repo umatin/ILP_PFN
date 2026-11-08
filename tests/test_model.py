@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -24,16 +25,40 @@ def _items(n, seed=0):
     return out
 
 
-def test_kv_cache_matches_full_forward():
-    model = tiny().eval()
-    ids = torch.randint(0, len(VOCAB), (2, 40))
+@pytest.mark.parametrize("role_emb", [False, True])
+def test_kv_cache_matches_full_forward(role_emb):
+    model = tiny(role_emb=role_emb).eval()
+    _, enc = _items(1)[0]
+    ids = torch.tensor([enc.ids, enc.ids])
+    T, split = ids.shape[1], enc.rule_start
     with torch.no_grad():
         full = model.logits(model(ids))
         caches = model.new_caches()
-        step = [model.logits(model(ids[:, :25], caches))]
-        for t in range(25, 40):
-            step.append(model.logits(model(ids[:, t:t + 1], caches)))
+        step = [model.logits(model(ids[:, :split], caches))]
+        for t in range(split, T):
+            roles = None
+            if role_emb:  # roles of the newest token from the full history, as in generate()
+                sec, role = model.roles(ids[:, :t + 1])
+                roles = (sec[:, -1:], role[:, -1:])
+            step.append(model.logits(model(ids[:, t:t + 1], caches, roles)))
     assert torch.allclose(full, torch.cat(step, 1), atol=1e-4)
+
+
+def test_roles_of_an_encoded_sequence():
+    model = tiny(role_emb=True)
+    toks = ["<bos>", "<facts>", "p2", "c11", ";", "p7", "c11", "c3", "<bk>",
+            "p9", "V0", "V1", ":-", "not", "p2", "V0", ";", "p7", "V1", "V0", ".",
+            "<pos>", "T", "c3", "c11", "<neg>", "T", "c11", "c3", "<rule>",
+            "T", "V0", "V1", ":-", "p7", "V1", "V0", ".", "<eos>"]
+    sec, role = model.roles(torch.tensor([VOCAB.ids(toks)]))
+    expect_role = [0, 0, 1, 2, 0, 1, 2, 3, 0,
+                   1, 2, 3, 0, 0, 1, 2, 0, 1, 2, 3, 0,
+                   0, 1, 2, 3, 0, 1, 2, 3, 0,
+                   1, 2, 3, 0, 1, 2, 3, 0, 0]
+    expect_sec = [0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                  3, 3, 3, 3, 4, 4, 4, 4] + [5] * 10
+    assert role[0].tolist() == expect_role
+    assert sec[0].tolist() == expect_sec
 
 
 def test_causality():

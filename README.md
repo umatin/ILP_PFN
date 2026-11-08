@@ -30,6 +30,25 @@ python -m ilp_pfn.evaluate --ckpt runs/base/ckpt.pt --n 500 --k 16
 
 Prior overrides are passed as JSON, e.g. `--prior '{"allow_negation": true}'`.
 
+### Curriculum
+
+```bash
+python -m ilp_pfn.train --out_dir runs/cur --curriculum default --final_steps 50000 \
+    --eval_every 1000 --n_val_decode 200 ...
+```
+
+Training goes through levels `L0_single_literal → L1_conjunctions → L2_bk_disjunction →
+L3_near_full → L4_full` (defined in `ilp_pfn/curriculum.py`; pass a JSON file for your own).
+
+- **Advancing.** At each evaluation, greedy consistency (`--cur_metric`) is measured on a fixed
+  validation set of the *current* level. Training moves to the next level after `--cur_patience`
+  consecutive evaluations at or above the level's threshold, with at least `--cur_min_steps` spent
+  on the level. After `--cur_max_steps` it advances anyway, and the history marks this as `forced`.
+- **Replay.** `--replay_frac` of every batch comes from earlier levels.
+- **Learning rate.** Constant until the last level, then cosine-decayed over `--final_steps`.
+- **Logs.** Advancements are printed as `ADVANCE {...}` and written to `metrics.jsonl`. During the
+  curriculum, each evaluation also reports `final_level` metrics on the full prior.
+
 ## Code layout
 
 | File | Content |
@@ -38,6 +57,7 @@ Prior overrides are passed as JSON, e.g. `--prior '{"allow_negation": true}'`.
 | `ilp_pfn/prior.py` | `PriorConfig` and `sample_task`: world, BK rules, target rule, examples |
 | `ilp_pfn/tokenizer.py` | serialisation, per-episode anonymous symbols, canonical rule form, parser |
 | `ilp_pfn/verify.py` | checks a generated rule: valid / consistent / semantic / exact / held-out accuracy |
+| `ilp_pfn/curriculum.py` | curriculum levels, replay mixture, performance-gated advancement |
 | `ilp_pfn/splits.py` | evaluation splits (iid and distribution shifts), deterministic eval sets |
 | `ilp_pfn/model.py` | decoder-only transformer with RoPE and a KV cache, sampling |
 | `ilp_pfn/train.py`, `evaluate.py` | training loop (resumable) and evaluation CLI |
