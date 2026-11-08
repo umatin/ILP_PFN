@@ -141,10 +141,10 @@ def test_loads_older_checkpoints():
     new = tiny(role_emb=True, query_head=True)
     old_sd = {k: v.clone() for k, v in new.state_dict().items() if not k.startswith("qhead")}
     old_sd["emb.weight"] = old_sd["emb.weight"][:-1]      # vocab without <query>
-    old_sd["head.weight"] = old_sd["emb.weight"]
+    old_sd["head.weight"] = old_sd["emb.weight"]              # older models had a tied head
     old_sd["sec_emb.weight"] = old_sd["sec_emb.weight"][:-1]  # sections without <query>
     model = tiny(role_emb=True, query_head=True)
     assert load_state_compat(model, old_sd)
     assert torch.equal(model.emb.weight[:-1], old_sd["emb.weight"])
-    assert model.head.weight is model.emb.weight
+    assert torch.equal(model.head.weight[:-1], old_sd["emb.weight"])
     assert not load_state_compat(model, new.state_dict())  # same version: nothing adapted

@@ -101,6 +101,24 @@ L3_near_full → L4_full` (defined in `ilp_pfn/curriculum.py`; pass a JSON file 
 - **Target**: the canonical rule (variables numbered by first occurrence, literals and clauses
   sorted). The loss covers only the rule tokens.
 
+## Initialisation
+
+The model uses fan-in initialisation. Linear weights have std `1/sqrt(in_features)`, and residual
+output projections are additionally divided by `sqrt(2 * n_layers)`. Token embeddings have std 1.
+Role and section embeddings start small (std 0.02). The output head is untied.
+
+The first version used GPT-2-style std 0.02 for all weights. With that, attention starts almost
+exactly uniform, and on in-context lookup the model stayed at chance for thousands of steps. On a
+2-layer "has this token appeared before?" probe after 600 steps:
+
+| Initialisation | Accuracy |
+|---|---|
+| std 0.02 everywhere | 0.51 |
+| fan-in | 0.98 |
+| `nn.TransformerEncoder` reference | 0.999 |
+
+Checkpoints trained with the old initialisation still load.
+
 ## Metrics
 
 All metrics are reported for greedy decoding and for the best of k samples. The best sample is the

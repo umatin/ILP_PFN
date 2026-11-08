@@ -83,8 +83,7 @@ class GPT(nn.Module):
         self.emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
         self.ln_f = nn.LayerNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        self.head.weight = self.emb.weight  # tied
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)  # untied
         hd = cfg.d_model // cfg.n_heads
         inv = 1.0 / cfg.rope_base ** (torch.arange(0, hd, 2).float() / hd)
         freqs = torch.outer(torch.arange(cfg.max_len).float(), inv)
@@ -101,14 +100,24 @@ class GPT(nn.Module):
         if cfg.query_head:
             self.qhead = nn.Linear(cfg.d_model, 1)
         self.apply(self._init)
-        for blk in self.blocks:  # scaled init of residual projections
+        for blk in self.blocks:  # residual output projections: scaled down by depth
             for w in (blk.attn.proj.weight, blk.mlp[2].weight):
-                nn.init.normal_(w, std=0.02 / math.sqrt(2 * cfg.n_layers))
+                nn.init.normal_(w, std=w.shape[1] ** -0.5 / math.sqrt(2 * cfg.n_layers))
+        if cfg.role_emb:  # start as weak hints, so they don't drown out token identity
+            nn.init.normal_(self.sec_emb.weight, std=0.02)
+            nn.init.normal_(self.role_emb.weight, std=0.02)
 
     @staticmethod
     def _init(m):
-        if isinstance(m, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(m.weight, std=0.02)
+        # Fan-in init (std 1/sqrt(in_features)) and unit-variance embeddings. The GPT-2 style
+        # std=0.02 everywhere starts attention almost perfectly uniform; on in-context lookup it
+        # left the model stuck at chance for thousands of steps (see README, "Initialisation").
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=m.in_features ** -0.5)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, std=1.0)
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -168,13 +177,11 @@ def load_state_compat(model: GPT, sd: dict) -> bool:
     get a fresh init) and no query head (left at its init).
     """
     own, sd, adapted = model.state_dict(), dict(sd), False
-    for k in ("emb.weight", "sec_emb.weight"):
+    for k in ("emb.weight", "sec_emb.weight", "head.weight"):
         if k in sd and k in own and sd[k].shape[0] < own[k].shape[0]:
             extra = torch.randn(own[k].shape[0] - sd[k].shape[0], own[k].shape[1]) * 0.02
             sd[k] = torch.cat([sd[k], extra.to(sd[k].dtype)])
             adapted = True
-    if "head.weight" in sd:
-        sd["head.weight"] = sd["emb.weight"]  # tied
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if set(missing) - {"qhead.weight", "qhead.bias"} or unexpected:
         raise RuntimeError(f"incompatible checkpoint: missing {missing}, unexpected {unexpected}")
