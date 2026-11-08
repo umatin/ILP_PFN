@@ -30,20 +30,10 @@ python -m ilp_pfn.evaluate --ckpt runs/base/ckpt.pt --n 500 --k 16
 
 Prior overrides are passed as JSON, e.g. `--prior '{"allow_negation": true}'`.
 
-### Auxiliary query loss
-
-`--query_frac 0.5` replaces half of the training sequences with *query sequences*. These contain
-the same prompt, then `<query>` and 16 unlabelled atoms. A yes/no head predicts, from the hidden
-state at the last token of each atom, whether that atom is true. Query kinds:
-
-- `target`: `T(a,b)`, the posterior predictive.
-- `base`: is the fact in the input? This is pure lookup.
-- `derived`: does a BK-derived atom hold? This is deduction.
-
-The answers never appear in the sequence, and the true rule is never visible to the queries, so
-nothing leaks into rule generation. Evaluations report `q_acc_target`, `q_acc_base` and
-`q_acc_derived`. Role embeddings (`--role_emb`, on by default) add section and argument-position
-embeddings to every token.
+Role embeddings (`--role_emb`, on by default) add two learned vectors to every token: one for its
+section (facts / bk / pos / neg / rule) and one for its position within an atom (predicate /
+first argument / second argument). Both are computed from the token sequence itself, so they also
+work during generation.
 
 ### Curriculum
 

@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from .curriculum import CurriculumState, Level, load_curriculum, mixture
 from .data import TaskStream, collate
-from .evaluate import autocast, evaluate_items, pick_device, query_accuracy, teacher_forced
+from .evaluate import autocast, evaluate_items, pick_device, teacher_forced
 from .model import GPT, ModelConfig, load_state_compat
 from .prior import PriorConfig
 from .splits import make_items, split_seed
@@ -49,10 +49,6 @@ class TrainConfig:
     max_len: int = 1024
     num_workers: int = 8
     pad_multiple: int = 64       # fewer distinct shapes for torch.compile
-    # auxiliary query loss (see tokenizer.encode_queries)
-    query_frac: float = 0.0      # fraction of training sequences that are query sequences
-    query_weight: float = 1.0    # weight of the yes/no loss relative to the rule loss
-    n_queries: int = 16          # query atoms per query sequence
     # curriculum
     curriculum: str = "none"     # "none", "default", or path to a JSON list of levels
     cur_metric: str = "greedy_consistent"
@@ -135,7 +131,7 @@ def main():
         raise ValueError(f"--cur_metric must be one of {sorted(gate_metrics)}")
     mcfg = ModelConfig(vocab_size=len(VOCAB), d_model=cfg.d_model, n_layers=cfg.n_layers,
                        n_heads=cfg.n_heads, d_ff=4 * cfg.d_model, max_len=max(2048, cfg.max_len),
-                       role_emb=bool(cfg.role_emb), query_head=True)
+                       role_emb=bool(cfg.role_emb))
     model = GPT(mcfg).to(device)
     opt = make_optimizer(model, cfg, device)
 
@@ -171,8 +167,7 @@ def main():
     def make_batches():
         priors, weights = mixture(levels, state.level, cfg.replay_frac)
         # fresh stream per (re)start / level change, so tasks are never repeated
-        stream = TaskStream(priors, cfg.max_len, seed=(cfg.seed, step), weights=weights,
-                            query_frac=cfg.query_frac, n_queries=cfg.n_queries)
+        stream = TaskStream(priors, cfg.max_len, seed=(cfg.seed, step), weights=weights)
         loader = DataLoader(stream,
                             batch_size=cfg.batch_size, num_workers=cfg.num_workers,
                             collate_fn=partial(collate, multiple=cfg.pad_multiple),
@@ -189,8 +184,7 @@ def main():
     fwd = torch.compile(model, dynamic=False) if cfg.compile else model
     log = open(out / "metrics.jsonl", "a")
     batches = make_batches()
-    t_last, data_time, tokens = time.time(), 0.0, 0
-    losses, rule_losses, query_losses = [], [], []
+    t_last, data_time, tokens, losses = time.time(), 0.0, 0, []
 
     while step < end_step(cfg, state.final_start):
         model.train()
@@ -198,20 +192,11 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr
         t0 = time.time()
-        x, y, mask, qmask, qlab = (t.to(device, non_blocking=True) for t in next(batches))
+        x, y, mask = (t.to(device, non_blocking=True) for t in next(batches))
         data_time += time.time() - t0
         with autocast(device):
             h = fwd(x)
-            loss = h.new_zeros(())
-            if mask.any():
-                rule_loss = F.cross_entropy(model.logits(h[mask]).float(), y[mask])
-                loss = loss + rule_loss
-                rule_losses.append(rule_loss.item())
-            if qmask.any():
-                query_loss = F.binary_cross_entropy_with_logits(
-                    model.query_logit(h[qmask]).float(), qlab[qmask])
-                loss = loss + cfg.query_weight * query_loss
-                query_losses.append(query_loss.item())
+            loss = F.cross_entropy(model.logits(h[mask]).float(), y[mask])
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -222,9 +207,7 @@ def main():
 
         if step % cfg.log_every == 0:
             dt = time.time() - t_last
-            mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")  # noqa: E731
-            rec = dict(step=step, level=state.level, loss=mean(losses),
-                       rule_loss=mean(rule_losses), query_loss=mean(query_losses), lr=lr,
+            rec = dict(step=step, level=state.level, loss=sum(losses) / len(losses), lr=lr,
                        grad_norm=float(gnorm), tok_per_s=tokens / dt,
                        tasks_per_s=cfg.log_every * cfg.batch_size / dt,
                        data_wait_frac=data_time / dt)
@@ -232,8 +215,7 @@ def main():
                            for k, v in rec.items()), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
-            t_last, data_time, tokens = time.time(), 0.0, 0
-            losses, rule_losses, query_losses = [], [], []
+            t_last, data_time, tokens, losses = time.time(), 0.0, 0, []
 
         last = len(levels) - 1
         if step % cfg.eval_every == 0 or step == end_step(cfg, state.final_start):
@@ -243,9 +225,6 @@ def main():
             ev.update(teacher_forced(model, items[:cfg.n_val], device))
             summary, _ = evaluate_items(model, items[:cfg.n_val_decode], device, k=0)
             ev.update({k: v for k, v in summary.items() if k.startswith(("greedy", "majority"))})
-            if cfg.query_frac > 0:
-                ev.update(query_accuracy(model, items[:cfg.n_val_decode], device,
-                                         n_queries=cfg.n_queries))
             if state.level < last and cfg.eval_final:
                 fin, _ = evaluate_items(model, val_items(last)[:cfg.n_val_decode], device, k=0)
                 ev["final_level"] = {k: fin[k] for k in

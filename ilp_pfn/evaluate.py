@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import time
 from collections import Counter, defaultdict
@@ -20,7 +21,7 @@ from .logic import format_clause
 from .model import GPT, ModelConfig, generate, load_state_compat
 from .prior import PriorConfig, Task
 from .splits import SPLITS, make_items, split_config, split_seed
-from .tokenizer import VOCAB, Encoded, encode_queries
+from .tokenizer import VOCAB, Encoded
 from .verify import Check, check_rule, majority_query_acc
 
 
@@ -47,7 +48,7 @@ def teacher_forced(model: GPT, items, device, batch_size: int = 64) -> dict:
     tot_loss = tot_tok = tot_correct = seq_ok = 0
     for i in range(0, len(items), batch_size):
         batch = [(enc.ids, enc.rule_start) for _, enc in items[i:i + batch_size]]
-        x, y, mask = (t.to(device) for t in collate(batch)[:3])
+        x, y, mask = (t.to(device) for t in collate(batch))
         with autocast(device):
             logits = model.logits(model(x)).float()
         loss = F.cross_entropy(logits[mask], y[mask], reduction="sum")
@@ -58,27 +59,6 @@ def teacher_forced(model: GPT, items, device, batch_size: int = 64) -> dict:
         seq_ok += int(((correct | ~mask).all(1)).sum())
     return dict(tf_loss=tot_loss / tot_tok, tf_token_acc=tot_correct / tot_tok,
                 tf_rule_acc=seq_ok / len(items))
-
-
-@torch.no_grad()
-def query_accuracy(model: GPT, items, device, n_queries: int = 16, batch_size: int = 64,
-                   seed: int = 0) -> dict:
-    """Accuracy of the yes/no query head per query kind (target / base / derived facts)."""
-    model.eval()
-    rng = np.random.default_rng(seed)  # same queries at every evaluation
-    hits, totals = Counter(), Counter()
-    for i in range(0, len(items), batch_size):
-        qs = [encode_queries(task, enc, rng, n_queries) for task, enc in items[i:i + batch_size]]
-        x, _, _, qmask, qlab = collate([(q.ids, len(q.ids), q.positions, q.labels) for q in qs])
-        x, qmask = x.to(device), qmask.to(device)
-        with autocast(device):
-            pred = (model.query_logit(model(x)[qmask]).float() > 0).cpu()
-        correct = pred == qlab[qmask.cpu()].bool()
-        kinds = [k for q in qs for k in q.kinds]  # same order as the boolean mask (row-major)
-        for k, c in zip(kinds, correct.tolist()):
-            hits[k] += c
-            totals[k] += 1
-    return {f"q_acc_{k}": hits[k] / totals[k] for k in sorted(totals)}
 
 
 def _select(checks: list[Check]) -> Check | None:
@@ -158,8 +138,9 @@ def show_example(task: Task, enc: Encoded, greedy_tokens: str) -> str:
 
 def load_checkpoint(path, device) -> tuple[GPT, dict]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    cfg = dict(ck["model_cfg"], vocab_size=len(VOCAB))  # vocab may have grown since
-    model = GPT(ModelConfig(**cfg))
+    fields = {f.name for f in dataclasses.fields(ModelConfig)}
+    cfg = {k: v for k, v in ck["model_cfg"].items() if k in fields}  # drop removed options
+    model = GPT(ModelConfig(**dict(cfg, vocab_size=len(VOCAB))))
     load_state_compat(model, ck["model"])
     return model.to(device).eval(), ck
 
@@ -188,8 +169,6 @@ def main():
         summary, records = evaluate_items(model, items, device, k=args.k,
                                           temperature=args.temperature)
         summary.update(teacher_forced(model, items, device))
-        if model.cfg.query_head:
-            summary.update(query_accuracy(model, items, device))
         summary["seconds"] = time.time() - t0
         (out / f"{split}.json").write_text(json.dumps(summary, indent=1))
         with open(out / f"{split}_records.jsonl", "w") as f:
@@ -197,7 +176,6 @@ def main():
                 f.write(json.dumps(r) + "\n")
         keys = ["greedy_valid", "greedy_consistent", "greedy_semantic", "greedy_exact",
                 "greedy_query_acc", "majority_query_acc"] + [k for k in summary if "@" in k]
-        keys += [k for k in summary if k.startswith("q_acc_")]
         print(f"\n== {split} ({summary['seconds']:.0f}s)")
         print("  " + "  ".join(f"{k}={summary[k]:.3f}" for k in keys if summary[k] is not None))
         print(f"  errors: {summary['greedy_errors']}")

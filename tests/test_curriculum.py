@@ -59,7 +59,7 @@ def test_mixture_and_stream_weights():
     from ilp_pfn.tokenizer import VOCAB
     n_single = 0
     for _ in range(400):
-        ids, rs, *_ = next(stream)
+        ids, rs = next(stream)
         rule = VOCAB.toks(ids[rs:])
         n_single += rule.count(":-") == 1 and ";" not in rule
     assert n_single < 400  # mixture actually contains harder levels

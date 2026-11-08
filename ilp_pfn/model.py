@@ -21,7 +21,6 @@ class ModelConfig:
     max_len: int = 2048       # RoPE table size (training may use shorter sequences)
     rope_base: float = 10000.0
     role_emb: bool = False    # add section + atom-role embeddings to the token embeddings
-    query_head: bool = False  # yes/no head for query atoms (auxiliary loss)
 
 
 class KVCache:
@@ -97,8 +96,6 @@ class GPT(nn.Module):
             self.register_buffer("tok_is_pred", torch.tensor(is_pred), persistent=False)
             self.register_buffer("tok_is_term", torch.tensor(is_term), persistent=False)
             self.register_buffer("tok_section", torch.tensor(section), persistent=False)
-        if cfg.query_head:
-            self.qhead = nn.Linear(cfg.d_model, 1)
         self.apply(self._init)
         for blk in self.blocks:  # residual output projections: scaled down by depth
             for w in (blk.attn.proj.weight, blk.mlp[2].weight):
@@ -165,27 +162,22 @@ class GPT(nn.Module):
     def logits(self, h: torch.Tensor) -> torch.Tensor:
         return self.head(h)
 
-    def query_logit(self, h: torch.Tensor) -> torch.Tensor:
-        """Log-odds that the query atom ending at each given position is true."""
-        return self.qhead(h).squeeze(-1)
-
-
 def load_state_compat(model: GPT, sd: dict) -> bool:
-    """Load a state dict, also from older checkpoints. Returns True if anything was adapted.
+    """Load a state dict; returns True if it had to be adapted.
 
-    Older checkpoints may have fewer embedding rows (tokens/sections appended later; new rows
-    get a fresh init) and no query head (left at its init).
+    Checkpoints from the removed auxiliary-query version have an extra trailing ``<query>``
+    token row, an extra section row and a yes/no head; those parts are dropped.
     """
     own, sd, adapted = model.state_dict(), dict(sd), False
-    for k in ("emb.weight", "sec_emb.weight", "head.weight"):
-        if k in sd and k in own and sd[k].shape[0] < own[k].shape[0]:
-            extra = torch.randn(own[k].shape[0] - sd[k].shape[0], own[k].shape[1]) * 0.02
-            sd[k] = torch.cat([sd[k], extra.to(sd[k].dtype)])
+    for k in [k for k in sd if k.startswith("qhead.")]:
+        del sd[k]
+        adapted = True
+    for k in ("emb.weight", "head.weight", "sec_emb.weight"):
+        if k in sd and k in own and sd[k].shape[0] > own[k].shape[0]:
+            sd[k] = sd[k][:own[k].shape[0]]
             adapted = True
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if set(missing) - {"qhead.weight", "qhead.bias"} or unexpected:
-        raise RuntimeError(f"incompatible checkpoint: missing {missing}, unexpected {unexpected}")
-    return adapted or bool(missing)
+    model.load_state_dict(sd)
+    return adapted
 
 
 @torch.no_grad()
