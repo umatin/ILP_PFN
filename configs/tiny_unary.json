@@ -1,0 +1,6 @@
+[
+ {"name": "tiny_unary", "n_const": [5, 6], "n_unary": [2, 2], "n_binary": [0, 0],
+  "density": [0.3, 0.6], "n_bk": [0, 0], "p_tc": 0.0, "target_arity": [1, 1],
+  "min_n_unary_target": 4, "n_clauses": [1, 1], "body_len": [1, 1], "max_extra_vars": 0,
+  "max_pos": 3, "max_neg": 3}
+]

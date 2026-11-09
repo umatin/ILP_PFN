@@ -131,7 +131,11 @@ class GPT(nn.Module):
         pos = torch.arange(idx.shape[1], device=idx.device).expand_as(idx)
         none = torch.full_like(idx, -1)
         is_pred, is_term = self.tok_is_pred[idx], self.tok_is_term[idx]
-        section = torch.cummax(self.tok_section[idx], dim=1).values
+        # section of the most recent marker token (markers can alternate: <pos> ... <neg> ...)
+        tok_sec = self.tok_section[idx]
+        last_marker = torch.cummax(torch.where(tok_sec > 0, pos, none), dim=1).values
+        section = torch.where(last_marker >= 0, tok_sec.gather(1, last_marker.clamp(min=0)),
+                              torch.zeros_like(idx))
         last_pred = torch.cummax(torch.where(is_pred, pos, none), dim=1).values
         last_break = torch.cummax(torch.where(~is_pred & ~is_term, pos, none), dim=1).values
         in_atom = is_term & (last_pred > last_break)  # a term directly following a predicate

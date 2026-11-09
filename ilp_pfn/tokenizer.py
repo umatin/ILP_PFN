@@ -2,9 +2,12 @@
 
 Sequence layout (atoms are written without brackets, e.g. ``p3 c5 c1``)::
 
-    <bos> <facts> p3 c5 c1 ; p7 c4 ; ... <bk> p1 V0 V1 :- p3 V0 V2 ; p3 V2 V1 . ...
-          <pos> T c1 c2 ; ... <neg> T c4 c4 ; ... <rule> T V0 V1 :- p1 V0 V2 ; p7 V2 . <eos>
+    <bos> <facts> p3 c5 c1 p7 c4 ... <bk> p1 V0 V1 :- p3 V0 V2 ; p3 V2 V1 . ...
+          <pos> T c1 c2 <neg> T c4 c4 <pos> T c2 c2 ... <rule> T V0 V1 :- p1 V0 V2 ; p7 V2 . <eos>
 
+* Facts need no separators: every atom starts with a predicate token.
+* Every example carries its own label token (``<pos>`` / ``<neg>``); examples are shuffled
+  together, positives and negatives interleaved.
 * Constants and predicates get *fresh random token ids in every episode* (anonymisation);
   the target predicate is always ``T``.
 * Facts, BK clauses and examples are shuffled; the target program is written in canonical form
@@ -43,7 +46,8 @@ class Vocab:
 
 VOCAB = Vocab()
 
-# Section ids (0 = before <facts>); sections always appear in this order in a sequence.
+# Section ids (0 = before <facts>). A token belongs to the section of the most recent marker;
+# <pos> / <neg> markers label individual examples and can alternate.
 SECTION_OF = {"<facts>": 1, "<bk>": 2, "<pos>": 3, "<neg>": 4, "<rule>": 5}
 N_SECTIONS = 6
 # Atom roles: 0 = structural token, 1 = predicate, 2 = first argument, 3 = second argument,
@@ -142,11 +146,12 @@ def encode(task: Task, rng: np.random.Generator, vocab: Vocab = VOCAB) -> Encode
         return [xs[i] for i in rng.permutation(len(xs))]
 
     facts = [a for p in task.base_preds for a in atoms(p, true_tuples(task.base_ext[p]))]
-    toks = ["<bos>", "<facts>"] + _join(shuffled(facts)) + ["<bk>"]
+    toks = ["<bos>", "<facts>"] + [t for a in shuffled(facts) for t in a] + ["<bk>"]
     for c in shuffled([canonical_clause(c, pred_tok) for c in task.bk]):
         toks += clause_tokens(c, pred_tok)
-    toks += ["<pos>"] + _join(shuffled(atoms(task.target, task.pos)))
-    toks += ["<neg>"] + _join(shuffled(atoms(task.target, task.neg)))
+    examples = ([["<pos>"] + a for a in atoms(task.target, task.pos)]
+                + [["<neg>"] + a for a in atoms(task.target, task.neg)])
+    toks += [t for ex in shuffled(examples) for t in ex]
     toks += ["<rule>"]
     rule_start = len(toks)
     toks += program_tokens(task.target_clauses, pred_tok) + ["<eos>"]

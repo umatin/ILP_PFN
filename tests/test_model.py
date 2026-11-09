@@ -46,17 +46,19 @@ def test_kv_cache_matches_full_forward(role_emb):
 
 def test_roles_of_an_encoded_sequence():
     model = tiny(role_emb=True)
-    toks = ["<bos>", "<facts>", "p2", "c11", ";", "p7", "c11", "c3", "<bk>",
+    toks = ["<bos>", "<facts>", "p2", "c11", "p7", "c11", "c3", "<bk>",
             "p9", "V0", "V1", ":-", "not", "p2", "V0", ";", "p7", "V1", "V0", ".",
-            "<pos>", "T", "c3", "c11", "<neg>", "T", "c11", "c3", "<rule>",
-            "T", "V0", "V1", ":-", "p7", "V1", "V0", ".", "<eos>"]
+            "<neg>", "T", "c11", "c3", "<pos>", "T", "c3", "c11", "<neg>", "T", "c3", "c3",
+            "<rule>", "T", "V0", "V1", ":-", "p7", "V1", "V0", ".", "<eos>"]
     sec, role = model.roles(torch.tensor([VOCAB.ids(toks)]))
-    expect_role = [0, 0, 1, 2, 0, 1, 2, 3, 0,
+    expect_role = [0, 0, 1, 2, 1, 2, 3, 0,
                    1, 2, 3, 0, 0, 1, 2, 0, 1, 2, 3, 0,
-                   0, 1, 2, 3, 0, 1, 2, 3, 0,
-                   1, 2, 3, 0, 1, 2, 3, 0, 0]
-    expect_sec = [0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                  3, 3, 3, 3, 4, 4, 4, 4] + [5] * 10
+                   0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3,
+                   0, 1, 2, 3, 0, 1, 2, 3, 0, 0]
+    expect_sec = ([0] + [1] * 6 + [2] * 13          # <bos>, facts, bk
+                  + [4] * 4 + [3] * 4 + [4] * 4     # alternating example labels
+                  + [5] * 10)                       # rule
+    assert len(toks) == len(expect_role) == len(expect_sec)
     assert role[0].tolist() == expect_role
     assert sec[0].tolist() == expect_sec
 

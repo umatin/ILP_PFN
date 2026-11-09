@@ -31,8 +31,15 @@ def test_prompt_contains_no_derived_facts_and_no_rule():
     prompt = VOCAB.toks(enc.ids[:enc.rule_start])
     n_facts = sum(int(e.sum()) for e in t.base_ext.values())
     facts = prompt[prompt.index("<facts>") + 1:prompt.index("<bk>")]
-    assert facts.count(";") == n_facts - 1  # exactly the base facts, no derived ones
-    assert "T" not in prompt[:prompt.index("<pos>")]
+    assert sum(t.startswith("p") for t in facts) == n_facts  # exactly the base facts
+    assert len(facts) == sum((1 + t.arities[p]) * int(e.sum()) for p, e in t.base_ext.items())
+    assert "T" not in prompt[:prompt.index("<bk>")]
+    # every example is preceded by its own label, and labels match the task
+    first = min(i for i, x in enumerate(prompt) if x in ("<pos>", "<neg>"))
+    ex = prompt[first:]
+    labels = [x for x in ex if x in ("<pos>", "<neg>")]
+    assert labels.count("<pos>") == len(t.pos) and labels.count("<neg>") == len(t.neg)
+    assert ex.count("T") == len(t.pos) + len(t.neg) and ";" not in ex
 
 
 def test_canonical_form_is_invariant():

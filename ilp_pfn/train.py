@@ -73,6 +73,12 @@ class TrainConfig:
     n_val: int = 512             # teacher-forced validation tasks (per level)
     n_val_decode: int = 200      # greedy-decoded validation tasks (per level)
     eval_final: int = 1          # during a curriculum, also decode the final level's val set
+    eval_levels: str = "default"  # also evaluate each level separately: "default", "none", or a
+                                  # JSON curriculum file (levels are subsets of the full prior)
+    n_eval_level: int = 200      # tasks per level for the per-level evaluation
+    # loss
+    prompt_loss_weight: float = 1.0  # 1 = fully autoregressive (also predict the prompt tokens);
+                                     # 0 = loss on the rule tokens only
 
 
 def parse_args() -> TrainConfig:
@@ -154,6 +160,21 @@ def main():
     print(f"device {device}  params {model.n_params() / 1e6:.2f}M  "
           f"levels {[lv.name for lv in levels]}")
 
+    # fixed evaluation sets, one per level (independent of the training distribution)
+    eval_levels = ([] if cfg.eval_levels == "none" else load_curriculum(cfg.eval_levels, prior))
+    level_items = {lv.name: make_items(lv.prior, cfg.n_eval_level,
+                                       split_seed("eval_level/" + lv.name), max_len=cfg.max_len)
+                   for lv in eval_levels}
+
+    def evaluate_levels() -> dict:
+        out = {}
+        for name, its in level_items.items():
+            tf = teacher_forced(model, its, device)
+            s, _ = evaluate_items(model, its, device, k=0)
+            out[name] = dict(tf_loss=tf["tf_loss"], valid=s["greedy_valid"],
+                             consistent=s["greedy_consistent"], exact=s["greedy_exact"])
+        return out
+
     val_cache: dict[int, list] = {}
 
     def val_items(k: int):
@@ -184,7 +205,8 @@ def main():
     fwd = torch.compile(model, dynamic=False) if cfg.compile else model
     log = open(out / "metrics.jsonl", "a")
     batches = make_batches()
-    t_last, data_time, tokens, losses = time.time(), 0.0, 0, []
+    t_last, data_time, tokens = time.time(), 0.0, 0
+    losses, rule_losses, prompt_losses = [], [], []
 
     while step < end_step(cfg, state.final_start):
         model.train()
@@ -196,18 +218,27 @@ def main():
         data_time += time.time() - t0
         with autocast(device):
             h = fwd(x)
-            loss = F.cross_entropy(model.logits(h[mask]).float(), y[mask])
+            rule_loss = F.cross_entropy(model.logits(h[mask]).float(), y[mask])
+            loss = rule_loss
+            if cfg.prompt_loss_weight > 0:  # next-token loss on the prompt as well
+                prompt = ~mask & (y != VOCAB.pad_id)
+                prompt_loss = F.cross_entropy(model.logits(h[prompt]).float(), y[prompt])
+                loss = loss + cfg.prompt_loss_weight * prompt_loss
+                prompt_losses.append(prompt_loss.item())
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
         step += 1
         losses.append(loss.item())
+        rule_losses.append(rule_loss.item())
         tokens += x.numel()
 
         if step % cfg.log_every == 0:
             dt = time.time() - t_last
-            rec = dict(step=step, level=state.level, loss=sum(losses) / len(losses), lr=lr,
+            mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")  # noqa: E731
+            rec = dict(step=step, level=state.level, loss=mean(losses),
+                       rule_loss=mean(rule_losses), prompt_loss=mean(prompt_losses), lr=lr,
                        grad_norm=float(gnorm), tok_per_s=tokens / dt,
                        tasks_per_s=cfg.log_every * cfg.batch_size / dt,
                        data_wait_frac=data_time / dt)
@@ -215,7 +246,8 @@ def main():
                            for k, v in rec.items()), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
-            t_last, data_time, tokens, losses = time.time(), 0.0, 0, []
+            t_last, data_time, tokens = time.time(), 0.0, 0
+            losses, rule_losses, prompt_losses = [], [], []
 
         last = len(levels) - 1
         if step % cfg.eval_every == 0 or step == end_step(cfg, state.final_start):
@@ -229,8 +261,14 @@ def main():
                 fin, _ = evaluate_items(model, val_items(last)[:cfg.n_val_decode], device, k=0)
                 ev["final_level"] = {k: fin[k] for k in
                                      ("greedy_valid", "greedy_consistent", "greedy_query_acc")}
+            if level_items:
+                ev["levels"] = evaluate_levels()
             ev["eval_seconds"] = time.time() - t0
             print("EVAL " + json.dumps(ev), flush=True)
+            if level_items:
+                print(f"LEVELS step {step}: " + " | ".join(
+                    f"{n.split('_')[0]} cons {v['consistent']:.2f} tf {v['tf_loss']:.3f}"
+                    for n, v in ev["levels"].items()), flush=True)
             log.write(json.dumps(dict(eval=ev)) + "\n")
             event = state.observe(ev.get(cfg.cur_metric), step, levels, cfg.cur_min_steps,
                                   cfg.cur_max_steps, cfg.cur_patience)

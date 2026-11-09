@@ -30,6 +30,23 @@ python -m ilp_pfn.evaluate --ckpt runs/base/ckpt.pt --n 500 --k 16
 
 Prior overrides are passed as JSON, e.g. `--prior '{"allow_negation": true}'`.
 
+**Loss.** By default training is fully autoregressive: next-token loss on the rule plus, with
+`--prompt_loss_weight` (default 1.0), next-token loss on the prompt. The two terms are averaged
+separately, so the few rule tokens are not drowned out by the long prompt. Set
+`--prompt_loss_weight 0` for rule-only training.
+
+**Per-level evaluation.** At every evaluation, `--eval_levels default` (on by default) evaluates
+200 fixed tasks from each curriculum level L0–L4 separately. It does this whatever distribution is
+being trained on. Look for the `LEVELS step …` lines, or `eval.levels` in `metrics.jsonl`.
+
+Minimal sanity tasks (`--curriculum configs/<name>.json`). Each has a single decision:
+
+| Config | Task | Tokens (mean) |
+|---|---|---|
+| `tiny_unary.json` | 2 unary predicates, which one is `T`? (match one constant) | 33 |
+| `tiny_binary.json` | 1 binary predicate, `p(X,Y)` or `p(Y,X)`? (match a pair) | 55 |
+| `l0_only.json` | curriculum level 0 (both of the above, larger worlds) | 90 |
+
 Role embeddings (`--role_emb`, on by default) add two learned vectors to every token: one for its
 section (facts / bk / pos / neg / rule) and one for its position within an atom (predicate /
 first argument / second argument). Both are computed from the token sequence itself, so they also
@@ -87,7 +104,10 @@ L3_near_full → L4_full` (defined in `ilp_pfn/curriculum.py`; pass a JSON file 
     - in 50% of tasks the target must use a derived predicate.
 - **Input**: base facts, BK *rules* (not their consequences), and at most 10 positive and 10
   negative examples. The remaining tuples are held out as queries. Constants and predicates get
-  random token ids in every episode, and facts, BK rules and examples are shuffled.
+  random token ids in every episode, and facts, BK rules and examples are shuffled. Facts have no
+  separators, because every atom starts with a predicate token. Each example carries its own
+  label, and positives and negatives are interleaved:
+  `<facts> p1 c14 p5 c6 <bk> <neg> T c6 <pos> T c5 <rule> T V0 :- p1 V0 . <eos>`
 - **Target**: the canonical rule (variables numbered by first occurrence, literals and clauses
   sorted). The loss covers only the rule tokens.
 
